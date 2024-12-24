@@ -1,8 +1,10 @@
 import logging
+import feedparser
 import requests
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from src.utils.utils import format_published_time, replace_non_domain
 class Friend:
     """
     代表一个朋友的博客信息。
@@ -106,7 +108,7 @@ class FriendLinkManager:
         friend = Friend(name, blog_url, avatar, feed_url, feed_type)
 
         if feed_type != 'none':
-            feed_info = self._parse_feed(feed_url)
+            feed_info = self._parse_feed(feed_url, blog_url)
             articles = [
                 {
                     'title': article['title'],
@@ -129,10 +131,15 @@ class FriendLinkManager:
         检查并返回一个博客的 RSS 或 Atom 链接
         """
         possible_feeds = [
-            ('atom', '/atom.xml'),
-            ('rss2', '/rss2.xml'),
-            ('feed', '/feed')
-        ]
+        ('atom', '/atom.xml'),
+        ('rss', '/rss.xml'), # 2024-07-26 添加 /rss.xml内容的支持
+        ('rss2', '/rss2.xml'),
+        ('rss3', '/rss.php'), # 2024-12-07 添加 /rss.php内容的支持
+        ('feed', '/feed'),
+        ('feed2', '/feed.xml'), # 2024-07-26 添加 /feed.xml内容的支持
+        ('feed3', '/feed/'),
+        ('index', '/index.xml') # 2024-07-25 添加 /index.xml内容的支持
+    ]
 
         for feed_type, path in possible_feeds:
             feed_url = blog_url.rstrip('/') + path
@@ -143,21 +150,58 @@ class FriendLinkManager:
             except requests.RequestException:
                 continue
 
+        logging.warning(f"无法找到 {blog_url} 的 feed 地址")
         return 'none', blog_url
 
-    def _parse_feed(self, url):
+    def _parse_feed(self, url, blog_url):
         """
         解析 RSS 或 Atom feed 返回文章信息
         """
-        # 这里只是返回一个示例结构，具体实现根据你的代码进行解析
-        return {
-            'website_name': 'Example Site',
-            'author': 'Example Author',
-            'link': url,
-            'articles': [
-                {'title': 'Example Article', 'published': '2024-12-23 12:00', 'link': url}
-            ]
-        }
+        try:
+            response = self.session.get(url, headers=self.headers, timeout=self.timeout)
+            response.encoding = response.apparent_encoding
+            feed = feedparser.parse(response.text)
+            
+            result = {
+                'website_name': feed.feed.get('title', 'Unknown'),
+                'author': feed.feed.get('author', 'Unknown'),
+                'link': feed.feed.get('link', url),
+                'articles': []
+            }
+            
+            for _, entry in enumerate(feed.entries):
+                if 'published' in entry:
+                    published = format_published_time(entry.published)
+                elif 'updated' in entry:
+                    published = format_published_time(entry.updated)
+                    logging.warning(f"文章 {entry.title} 无发布时间，使用更新时间代替")
+                else:
+                    published = 'Unknown'
+                    logging.warning(f"文章 {entry.title} 无发布时间")
+                
+                article_link = replace_non_domain(entry.link, blog_url=blog_url) if 'link' in entry else ''
+            
+                article = {
+                    'title': entry.title if 'title' in entry else 'Unknown',
+                    'author': result['author'],
+                    'link': article_link,
+                    'published': published,
+                    'summary': entry.summary if 'summary' in entry else 'Unknown',
+                    'content': entry.content[0].value if 'content' in entry else 'Unknown'
+                }
+                result['articles'].append(article)
+                # 这里实现对文章按照时间排序
+                
+                return result
+        except Exception as e:
+            logging.error(f"解析 {url} 时出现错误：{e}", exc_info=True)
+            return {
+                'website_name': '',
+                'author': '',
+                'link': '',
+                'articles': []
+            }
+            
 
     def _save_to_json(self, data, filename):
         """
@@ -166,4 +210,5 @@ class FriendLinkManager:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
         logging.info(f"{filename} 保存成功")
+        
 
